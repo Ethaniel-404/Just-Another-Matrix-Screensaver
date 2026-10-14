@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Matrix Screensaver</title>
+<style>
+    html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+    body.idle { cursor: none; }
+    canvas { display: block; width: 100vw; height: 100vh; }
+
+    /* Scanlines: finas y suaves, para que el verde conserve su brillo */
+    .scanlines {
+        position: fixed; inset: 0; pointer-events: none;
+        background: repeating-linear-gradient(to bottom,
+            rgba(0, 0, 0, 0.35) 0, rgba(0, 0, 0, 0.35) 1px,
+            transparent 1px, transparent 3px);
+    }
+    .scanlines.off { display: none; }
+</style>
+</head>
+<body class="idle">
+<canvas id="matrix"></canvas>
+<div class="scanlines" id="scanlines"></div>
+
+<script>
+// ---------- Configuración ----------
+const CELL = 24;                    // tamaño de cada celda en px
+const FPS = 24;                     // cuadros por segundo de la animación
+const FONT = `${CELL}px "MS Gothic", "Hiragino Kaku Gothic ProN", "Noto Sans Mono CJK JP", "Noto Sans JP", monospace`;
+const MUTATE = 0.025;               // probabilidad por cuadro de que un glifo de la estela cambie
+const MIN_SPEED = 0.3, MAX_SPEED = 0.95;   // filas por cuadro
+const MIN_DECAY = 0.86, MAX_DECAY = 0.945; // cuanto más alto, más larga la estela
+
+// Katakana de ancho medio (ｦ–ﾝ), dígitos y unos pocos símbolos, como en la película
+const GLYPHS = [];
+for (let c = 0xFF66; c <= 0xFF9D; c++) GLYPHS.push(String.fromCharCode(c));
+GLYPHS.push(..."0123456789".split(""), ..."Z:.=*+-<>¦|".split(""));
+const rndGlyph = () => (Math.random() * GLYPHS.length) | 0;
+
+// Paleta de intensidades: de verde oscuro a verde claro cerca de la cabeza
+const LEVELS = 64;
+const palette = [];
+for (let i = 0; i < LEVELS; i++) {
+    const t = (i + 1) / LEVELS;
+    const m = Math.pow(t, 1.5);
+    const k = Math.max(0, (t - 0.8) / 0.2);   // el último tramo se aclara hacia blanco
+    palette.push(`rgb(${(k * 150 * m) | 0},${(255 * m) | 0},${((65 + k * 120) * m) | 0})`);
+}
+
+// ---------- Estado ----------
+const canvas = document.getElementById('matrix');
+const ctx = canvas.getContext('2d');
+let W, H, cols, rows, offsetX;
+let streams = [];            // una gota por columna
+let inten = new Float32Array(0);   // intensidad por celda (0..1)
+let glyph = new Uint8Array(0);     // glifo por celda
+
+const rand = (a, b) => a + Math.random() * (b - a);
+function newStream(initial) {
+    return {
+        head: -rand(0, rows * (initial ? 1 : 0.7)),   // arrancan escalonadas, no todas en 1
+        speed: rand(MIN_SPEED, MAX_SPEED),
+        decay: rand(MIN_DECAY, MAX_DECAY)
+    };
+}
+
+function resize() {
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    W = window.innerWidth; H = window.innerHeight;
+    canvas.width = Math.round(W * dpr);
+    canvas.height = Math.round(H * dpr);
+    // Espejado horizontal: los glifos de la película están invertidos
+    ctx.setTransform(-dpr, 0, 0, dpr, W * dpr, 0);
+    ctx.font = FONT;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+
+    const oldCols = cols, oldRows = rows, oldInten = inten, oldGlyph = glyph;
+    cols = Math.ceil(W / CELL);
+    rows = Math.ceil(H / CELL);
+    offsetX = (W - cols * CELL) / 2 + CELL / 2;
+
+    inten = new Float32Array(cols * rows);
+    glyph = new Uint8Array(cols * rows);
+    for (let i = 0; i < cols * rows; i++) glyph[i] = rndGlyph();
+
+    // Conserva lo que ya estaba en pantalla; las columnas nuevas arrancan escalonadas
+    const next = [];
+    for (let i = 0; i < cols; i++) {
+        next.push(streams[i] || newStream(true));
+        if (oldCols && i < oldCols) {
+            for (let r = 0; r < Math.min(rows, oldRows); r++) {
+                inten[i * rows + r] = oldInten[i * oldRows + r];
+                glyph[i * rows + r] = oldGlyph[i * oldRows + r];
+            }
+        }
+    }
+    streams = next;
+    if (oldCols) render();
+}
+
+// ---------- Simulación ----------
+function tick() {
+    for (let i = 0; i < cols; i++) {
+        const s = streams[i];
+        const prev = Math.floor(s.head);
+        s.head += s.speed;
+        const cur = Math.floor(s.head);
+        for (let r = prev + 1; r <= cur; r++) {
+            if (r >= 0 && r < rows) {
+                inten[i * rows + r] = 1;
+                glyph[i * rows + r] = rndGlyph();
+            }
+        }
+        // Cuando la gota salió y la estela se apagó, reaparece con otra velocidad
+        if (s.head > rows + rand(0, rows * 0.6)) {
+            const n = newStream(false);
+            s.head = n.head; s.speed = n.speed; s.decay = n.decay;
+        }
+    }
+}
+
+function render() {
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, W, H);
+    ctx.shadowBlur = 0;
+
+    for (let i = 0; i < cols; i++) {
+        const decay = streams[i].decay;
+        const x = offsetX + i * CELL;
+        for (let r = 0; r < rows; r++) {
+            const idx = i * rows + r;
+            let t = inten[idx];
+            if (t < 0.04) { inten[idx] = 0; continue; }
+            t *= decay;
+            inten[idx] = t;
+            // Los glifos de la estela mutan mientras caen
+            if (Math.random() < MUTATE) glyph[idx] = rndGlyph();
+            ctx.fillStyle = palette[Math.min(LEVELS - 1, (t * LEVELS) | 0)];
+            ctx.fillText(GLYPHS[glyph[idx]], x, r * CELL + CELL / 2);
+        }
+    }
+
+    // Cabezas casi blancas, con un leve resplandor verde
+    ctx.shadowColor = '#00ff41';
+    ctx.shadowBlur = 14;
+    ctx.fillStyle = '#e6ffee';
+    for (let i = 0; i < cols; i++) {
+        const r = Math.floor(streams[i].head);
+        if (r >= 0 && r < rows) {
+            ctx.fillText(GLYPHS[glyph[i * rows + r]], offsetX + i * CELL, r * CELL + CELL / 2);
+        }
+    }
+    ctx.shadowBlur = 0;
+}
+
+// ---------- Bucle (24 fps estables) ----------
+const STEP = 1000 / FPS;
+let last = 0;
+function loop(now) {
+    requestAnimationFrame(loop);
+    const delta = now - last;
+    if (delta < STEP) return;
+    last = now - (delta % STEP);    // evita el jitter de 33/50 ms en monitores de 60 Hz
+    tick();
+    render();
+}
+
+resize();
+for (let k = 0; k < rows * 2; k++) tick();   // precalienta para que no arranque vacío
+requestAnimationFrame(loop);
+window.addEventListener('resize', resize);
+
+// ---------- Comportamiento de salvapantallas ----------
+// Cursor oculto tras 2 s sin moverlo
+let idleTimer;
+function wake() {
+    document.body.classList.remove('idle');
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => document.body.classList.add('idle'), 2000);
+}
+window.addEventListener('mousemove', wake);
+wake();
+
+// Pantalla completa: doble clic o tecla F. Scanlines: tecla S.
+function toggleFullscreen() {
+    if (document.fullscreenElement) document.exitFullscreen();
+    else document.documentElement.requestFullscreen?.().catch(() => {});
+}
+window.addEventListener('dblclick', toggleFullscreen);
+window.addEventListener('keydown', e => {
+    const k = e.key.toLowerCase();
+    if (k === 'f') toggleFullscreen();
+    if (k === 's') document.getElementById('scanlines').classList.toggle('off');
+});
+
+// Evita que el equipo apague la pantalla mientras está activo
+let wakeLock = null;
+async function keepAwake() {
+    try {
+        if ('wakeLock' in navigator && document.visibilityState === 'visible') {
+            wakeLock = await navigator.wakeLock.request('screen');
+        }
+    } catch (e) { /* no disponible o denegado */ }
+}
+keepAwake();
+document.addEventListener('visibilitychange', keepAwake);
+window.addEventListener('pointerdown', () => { if (!wakeLock || wakeLock.released) keepAwake(); });
+</script>
+</body>
+</html>
